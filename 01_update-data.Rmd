@@ -1,0 +1,234 @@
+---
+title: "Surface Water Chem"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(fs)
+library(glue)
+library(httr)
+library(jsonlite)
+library(lubridate)
+library(vroom)
+```
+
+```{r}
+source('R/update-aos-files.R')
+lake_river_sites <- c('BARC', 'SUGG', 'CRAM', 'LIRO', 
+                      'PRPO', 'PRLA', 'TOOK', 'FLNT', 
+                      'BLWA', 'TOMB', 'BLUE')
+aq_site_ids <- readr::read_lines('aq_site_ids.txt')
+```
+
+## Update surface water chemistry data
+
+```{r}
+chem_box_dir = '~/Box/data/NEON/NEON_chem-surfacewater'
+myglob = 'externalLabData'
+chem_data_id = 'DP1.20093.001' # surface water chem
+mysite = 'PRLA'
+
+# # update_swchem_files(aq_site_ids[5])
+lake_river_sites %>% 
+  purrr::walk(~update_aos_files(chem_box_dir, 
+                                chem_data_id, 
+                                mysite = .x, 
+                                myglob = 'externalLabData'))
+lake_river_sites %>% 
+  purrr::walk(~update_aos_files(chem_box_dir, 
+                                chem_data_id, 
+                                mysite = .x, 
+                                myglob = 'fieldSuperParent'))
+lake_river_sites %>% 
+  purrr::walk(~update_aos_files(chem_box_dir, 
+                                chem_data_id, 
+                                mysite = .x, 
+                                myglob = 'swc_fieldData'))
+```
+
+## Update phytoplankter data
+
+```{r}
+phyto_dir = '~/Box/data/NEON/NEON_chem-peri-ses-phyto'
+phyto_data_id = 'DP1.20163.001' # phytoplankton chem
+update_aos_files(phyto_dir, phyto_data_id, mysite = 'FLNT', myglob = 'alg_fieldData')
+
+aq_site_ids %>% 
+  purrr::walk(~update_aos_files(phyto_dir, 
+                                phyto_data_id, 
+                                mysite = .x, 
+                                myglob = 'alg_fieldData'))
+aq_site_ids %>% 
+  purrr::walk(~update_aos_files(phyto_dir, 
+                                phyto_data_id, 
+                                mysite = .x, 
+                                myglob = 'algaeExternalLabDataPerSample'))
+
+```
+
+
+## Update phytoplankter taxonomy data
+
+```{r}
+taxo_dir <- '~/Box/data/NEON/NEON_peri-ses-phyto'
+taxo_data_id <- 'DP1.20166.001' # phytoplankton taxonomy
+myglob <- 'alg_taxonomyProcessed'
+
+lake_river_sites %>% 
+  purrr::walk(~update_aos_files(taxo_dir, 
+                                taxo_data_id, 
+                                mysite = .x, 
+                                myglob = 'alg_taxonomyProcessed'))
+
+```
+
+## Combine chlorophyll data
+
+```{r}
+phyto_dir2 <- '~/Box/data/NEON-processed/chl-a'
+
+# join the field and lab data files 
+# by site-months
+# mysite = 'POSE'
+join_field_and_lab <- function(mysite){
+  glue::glue('{phyto_dir}/{mysite}') %>% fs::dir_create()
+  glue::glue('{phyto_dir2}/{mysite}') %>% fs::dir_create()
+  lab_files <- fs::dir_ls(glue('{phyto_dir}/{mysite}'), glob = glue::glue("*algaeExternalLabDataPerSample*"))
+  field_files <- fs::dir_ls(glue('{phyto_dir}/{mysite}'), glob = glue::glue("*alg_fieldData*"))
+  
+  lab_months_have <- basename(lab_files) %>% 
+    stringr::str_split(pattern = '\\.', simplify = FALSE) %>%
+    purrr::map_chr(~.x[[8]])
+  
+  processed_months <- fs::dir_ls(glue::glue('{phyto_dir2}/{mysite}')) %>% 
+    basename() %>% tools::file_path_sans_ext() %>%
+    stringr::str_split('_') %>% purrr::map_chr(~.x[[2]])
+  
+  months_to_join <- lab_months_have[!lab_months_have %in% processed_months]
+  # my_month <- months_to_join[1]
+  join_month <- function(my_month){
+    lab_df <- grep(my_month, lab_files, value = TRUE) %>% 
+      readr::read_csv(col_types = readr::cols_only(domainID = 'c',
+                                            siteID = 'c',
+                                            sampleType = 'c',
+                                            namedLocation = 'c',
+                                            collectDate = 'D',
+                                            sampleID = 'c',
+                                            sampleCondition = 'c',
+                                            replicate = 'd',
+                                            analyte = 'c',
+                                            analyteConcentration = 'd',
+                                            plantAlgaeLabUnits = 'c',
+                                            externalLabDataQF = 'c')) %>% 
+      # readr::read_csv(col_types = 'ccccDccccDccddddcdccccc') %>%
+      dplyr::filter(sampleType %in% c('chlorophyll/pheophytin')) %>%
+      dplyr::select(domainID, siteID, namedLocation, collectDate,
+                    sampleID, sampleCondition, replicate,
+                    analyte, analyteConcentration, plantAlgaeLabUnits,
+                    externalLabDataQF)
+    field_cols <- 'cccccdddddcTcccccccccccccccccc'
+    field_df <- grep(my_month, field_files, value = TRUE) %>% 
+      readr::read_csv(col_types = field_cols) %>% 
+      dplyr::mutate(time_hms = hms::as_hms(collectDate),
+             collect_date = lubridate::as_date(collectDate)) %>%
+      dplyr::select(namedLocation, aquaticSiteType, collect_date,
+                    time_hms, parentSampleID, habitatType,
+                    algalSampleType, phytoDepth1,
+                    phytoDepth2, phytoDepth3, substratumSizeClass)
+    
+    # make table between sampleId and parentSampleID
+    # based on field table
+    my_lookups <- field_df$parentSampleID %>%
+      purrr::set_names(field_df$parentSampleID) %>%
+      purrr::map(~grep(.x, lab_df$sampleID, value = TRUE)) %>%
+      purrr::map_df(~as_tibble(.x), .id = 'parentSampleID') %>%
+      dplyr::rename(sampleID = value) %>% 
+      dplyr::distinct()
+
+    lab_join_field <- lab_df %>% 
+      dplyr::left_join(my_lookups, by = 'sampleID') %>%
+      dplyr::left_join(field_df, by = c('parentSampleID', 'namedLocation')) 
+    
+    lab_join_field %>% readr::write_csv(glue::glue('{phyto_dir2}/{mysite}/{mysite}_{my_month}.csv'))
+    message(glue::glue('Saved chl a lab data for {mysite} {my_month}'))
+    # return(lab_join_field)
+  }
+  
+  months_to_join %>% purrr::walk(~join_month(.x))
+  # all_lab_join_field %>%
+    # write_csv(glue('{phyto_dir2}/{mysite}_phyto-chem.csv'))
+}
+# join_field_and_lab('POSE')
+# aq_site_ids %>% purrr::walk(~join_field_and_lab(.x))
+lake_river_sites %>% purrr::walk(~join_field_and_lab(.x))
+```
+
+## Organize algal taxonomy
+
+acceptedTaxonID
+
+Morphospecies Cyanobacterial spheres is "UNKALG" taxonID
+
+
+for diatoms: 
+
+* algalAnalysisMethod = diatom slide
+* algalType = Bacillariophyceae
+* algalParameter = valves
+* division = Chrysophyta	
+* class = Bacillariophyceae
+
+```{r}
+mysite = 'PRPO'
+taxo_dir2 <- '~/Box/data/NEON-processed/alg-taxa'
+
+ 
+  glue::glue('{taxo_dir2}/{mysite}') %>% fs::dir_create()
+  lab_files <- glue::glue('{taxo_dir}/{mysite}') %>% fs::dir_ls()
+
+  lab_months_have <- basename(lab_files) %>% 
+    stringr::str_split(pattern = '\\.', simplify = FALSE) %>%
+    purrr::map_chr(~.x[[8]])
+  
+  processed_months <- fs::dir_ls(glue::glue('{taxo_dir2}/{mysite}')) %>% 
+    basename() %>% tools::file_path_sans_ext() %>%
+    stringr::str_split('_') %>% purrr::map_chr(~.x[[2]])
+  
+  months_to_process <- lab_months_have[!lab_months_have %in% processed_months]
+  
+  my_month <- months_to_process[14]
+
+  lab_df <- grep(my_month, lab_files, value = TRUE) %>% 
+      readr::read_csv(col_types = readr::cols_only(domainID = 'c',
+                                            siteID = 'c',
+                                            namedLocation = 'c',
+                                            collectDate = 'T',
+                                            sampleID = 'c',
+                                            sampleCondition = 'c',
+                                            algalType = 'c',
+                                            algalParameter = 'c',
+                                            algalParameterValue = 'd',
+                                            acceptedTaxonID = 'c',
+                                            scientificName = 'c',
+                                            morphospeciesID = 'c',
+                                            division = 'c',
+                                            class = 'c',
+                                            order = 'c',
+                                            family = 'c',
+                                            genus = 'c',
+                                            taxonRank = 'c')) %>%
+    dplyr::mutate(collectDate = lubridate::as_date(collectDate)) %>%
+    dplyr::filter(namedLocation %in% pref_locs_df$namedLocation)
+  
+  lab_df_top10 <- lab_df %>% dplyr::group_by(sampleID) %>%
+    dplyr::arrange(-algalParameterValue) %>%
+    dplyr::slice_head(n = 10)
+```
+
